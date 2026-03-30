@@ -1,0 +1,51 @@
+[Unit]
+Description=BIND DNS Domain Management API
+Documentation=https://github.com/livingopensource/bind-dns-api
+After=network.target named.service
+Wants=named.service
+
+[Service]
+Type=exec
+User=bind
+Group=bind
+
+# Working directory
+WorkingDirectory=/opt/bind-dns-api
+
+# Executable
+ExecStart=/opt/bind-dns-api/bind-dns-api -config /opt/bind-dns-api/config.json
+
+# Restart policy
+Restart=on-failure
+RestartSec=5s
+
+# Environment
+Environment="GIN_MODE=release"
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+
+# Allow write access to zones directory
+ReadWritePaths=/opt/bind-dns-api/zones
+
+# Allow network binding
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+
+# Resource limits
+LimitNOFILE=65536
+LimitNPROC=4096
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=bind-dns-api
+
+[Install]
+WantedBy=multi-user.target
