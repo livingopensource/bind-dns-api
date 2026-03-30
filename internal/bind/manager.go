@@ -43,7 +43,7 @@ func (m *Manager) ListDomains() ([]string, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
-	var domains []string
+	domains := make([]string, 0)
 
 	entries, err := os.ReadDir(m.config.ZoneDirectory)
 	if err != nil {
@@ -91,11 +91,12 @@ func (m *Manager) CreateDomain(domainName string, req models.CreateDomainRequest
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	if m.ZoneExists(domainName) {
+	zoneFile := m.getZoneFilePath(domainName)
+	// Check if exists directly (avoid deadlock from calling ZoneExists while holding lock)
+	if _, err := os.Stat(zoneFile); err == nil {
 		return fmt.Errorf("domain %s already exists", domainName)
 	}
 
-	zoneFile := m.getZoneFilePath(domainName)
 	content := m.generateZoneFile(domainName, req)
 
 	if err := os.WriteFile(zoneFile, []byte(content), 0644); err != nil {
@@ -110,11 +111,15 @@ func (m *Manager) UpdateDomain(domainName string, req models.CreateDomainRequest
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	if !m.ZoneExists(domainName) {
-		return fmt.Errorf("domain %s does not exist", domainName)
+	zoneFile := m.getZoneFilePath(domainName)
+	// Check if exists directly (avoid deadlock from calling ZoneExists while holding lock)
+	if _, err := os.Stat(zoneFile); err != nil {
+		if os.IsNotExist(err) {
+			return fmt.Errorf("domain %s does not exist", domainName)
+		}
+		return fmt.Errorf("failed to check domain existence: %w", err)
 	}
 
-	zoneFile := m.getZoneFilePath(domainName)
 	content := m.generateZoneFile(domainName, req)
 
 	if err := os.WriteFile(zoneFile, []byte(content), 0644); err != nil {
@@ -472,9 +477,10 @@ func (m *Manager) parseSOARecord(lines []string) models.SOARecord {
 }
 
 // parseRecordLine parses a single record line
+// Handles formats: NAME [TTL] [CLASS] TYPE VALUE or [TTL] [CLASS] NAME TYPE VALUE
 func (m *Manager) parseRecordLine(line string) *models.DNSRecord {
 	parts := strings.Fields(line)
-	if len(parts) < 4 {
+	if len(parts) < 3 {
 		return nil
 	}
 
@@ -482,14 +488,18 @@ func (m *Manager) parseRecordLine(line string) *models.DNSRecord {
 		ID:        generateRecordID(),
 		CreatedAt: time.Now(),
 		UpdatedAt: time.Now(),
+		TTL:       m.config.DefaultTTL, // Default TTL from config
 	}
 
 	idx := 0
 
-	// Check for TTL (numeric value at start)
+	// Check for TTL (numeric value) - can be first or second field
+	hasTTL := false
 	if ttl, err := strconv.Atoi(parts[idx]); err == nil {
+		// Format: TTL CLASS NAME TYPE VALUE
 		record.TTL = ttl
 		idx++
+		hasTTL = true
 	}
 
 	// Check for class (IN)
@@ -497,22 +507,48 @@ func (m *Manager) parseRecordLine(line string) *models.DNSRecord {
 		idx++
 	}
 
+	// Need at least NAME and TYPE
+	if idx >= len(parts)-1 {
+		return nil
+	}
+
 	// Record name
-	if idx < len(parts) {
-		record.Name = parts[idx]
+	record.Name = parts[idx]
+	idx++
+
+	// If we didn't find TTL at the start, check for it after name
+	// Format: NAME TTL CLASS TYPE VALUE
+	if !hasTTL && idx < len(parts) {
+		if ttl, err := strconv.Atoi(parts[idx]); err == nil {
+			record.TTL = ttl
+			idx++
+		}
+	}
+
+	// Skip class (IN) if present after name/TTL
+	if idx < len(parts) && strings.ToUpper(parts[idx]) == "IN" {
 		idx++
 	}
 
-	// Record type
-	if idx < len(parts) {
-		record.Type = models.DNSRecordType(strings.ToUpper(parts[idx]))
+	if idx >= len(parts) {
+		return nil
+	}
+
+	recordType := strings.ToUpper(parts[idx])
+	// Validate it's a known record type before assigning
+	switch recordType {
+	case "A", "AAAA", "CNAME", "MX", "TXT", "NS", "SOA", "PTR", "SRV":
+		record.Type = models.DNSRecordType(recordType)
 		idx++
+	default:
+		// If we don't recognize the type, this might not be a valid record line
+		return nil
 	}
 
 	// Record value (may include priority for MX records)
 	if idx < len(parts) {
 		// Check if next part is a priority number (for MX records)
-		if record.Type == models.RecordTypeMX && idx+1 < len(parts) {
+		if record.Type == models.RecordTypeMX && idx < len(parts) {
 			if priority, err := strconv.Atoi(parts[idx]); err == nil {
 				record.Priority = priority
 				idx++
@@ -547,11 +583,11 @@ func (m *Manager) matchesRecordLine(line, name string, recordType models.DNSReco
 	}
 
 	idx := 0
-	// Skip TTL if present
+	// Skip TTL if present at start
 	if _, err := strconv.Atoi(parts[idx]); err == nil {
 		idx++
 	}
-	// Skip class (IN)
+	// Skip class (IN) if present before name
 	if idx < len(parts) && strings.ToUpper(parts[idx]) == "IN" {
 		idx++
 	}
@@ -561,6 +597,18 @@ func (m *Manager) matchesRecordLine(line, name string, recordType models.DNSReco
 		return false
 	}
 	idx++
+
+	// Skip TTL if present after name (format: NAME TTL CLASS TYPE VALUE)
+	if idx < len(parts) {
+		if _, err := strconv.Atoi(parts[idx]); err == nil {
+			idx++
+		}
+	}
+
+	// Skip class (IN) if present after name/TTL
+	if idx < len(parts) && strings.ToUpper(parts[idx]) == "IN" {
+		idx++
+	}
 
 	// Check type
 	if idx >= len(parts) || strings.ToUpper(parts[idx]) != string(recordType) {

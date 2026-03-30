@@ -54,7 +54,7 @@ type Domain struct {
 
 // CreateDomainRequest represents the request body for creating a domain
 type CreateDomainRequest struct {
-	Name        string   `json:"name" binding:"required,dns"`
+	Name        string   `json:"name" binding:"required"`
 	Type        string   `json:"type"`
 	Nameservers []string `json:"nameservers"`
 	SOA         SOARecord `json:"soa"`
